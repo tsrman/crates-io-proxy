@@ -79,6 +79,7 @@ Options:
     -v, --verbose              print more debug info
     -h, --help                 print help and exit
     -V, --version              print version and exit
+    -N, --native-certs         use system native root certificates
     -L, --listen ADDRESS:PORT  address and port to listen at (0.0.0.0:3080)
         --listen-unix PATH     Unix domain socket path to listen at
     -U, --upstream-url URL     upstream download URL (https://crates.io/)
@@ -93,15 +94,49 @@ Environment:
     CRATES_IO_PROXY_URL        same as --proxy-url option
     CRATES_IO_PROXY_CACHE_DIR  same as --cache-dir option
     CRATES_IO_PROXY_CACHE_TTL  same as --cache-ttl option
+    https_proxy                upstream HTTPS proxy for outbound requests
+    HTTPS_PROXY                same as https_proxy (fallback)
 ```
+
+### Upstream proxy
+
+If the proxy server itself needs to reach crates.io through an upstream
+HTTP proxy (e.g. in corporate environments), set the `https_proxy` or
+`HTTPS_PROXY` environment variable:
+
+```
+export https_proxy=http://proxy.example.com:3128
+crates-io-proxy
+```
+
+Both `http://` and `socks5://` upstream proxy URLs are supported.
 
 Advanced configuration
 ----------------------
 
-By default, `crates-io-proxy` uses embedded TLS trusted root certificates.
-It is possible to configure it to use the system certificate store
-at the build time by setting the `native-certs` feature flag.
+By default, `crates-io-proxy` uses embedded TLS trusted root certificates
+(via `webpki-roots`). To enable system native root certificates at runtime,
+compile with the `native-certs` feature flag:
 
-Configuring this behavior at the run time is not supported yet.
+```
+cargo build --release --features native-certs
+```
+
+Then pass the `--native-certs` / `-N` flag when starting the proxy:
+
+```
+crates-io-proxy --native-certs
+```
+
+If the binary was compiled without the `native-certs` feature, the flag
+is accepted but a warning is printed and the embedded root certificates
+are used instead.
+
+Pre-built binaries
+------------------
+
+Pre-built Linux binaries (`x86_64` and `aarch64`) with the `native-certs`
+feature enabled are available on the
+[GitHub Releases](https://github.com/tsrman/crates-io-proxy/releases) page.
 
 [crates.io index]: https://github.com/rust-lang/crates.io-index

@@ -32,8 +32,15 @@ use std::env;
 use std::fmt::Display;
 use std::io::Read;
 use std::path::{Path, PathBuf};
+#[cfg(feature = "native-certs")]
+use std::sync::atomic::AtomicBool;
 use std::sync::OnceLock;
 use std::time::Duration;
+
+#[cfg(feature = "native-certs")]
+use std::sync::atomic::Ordering;
+#[cfg(feature = "native-certs")]
+use std::sync::Arc;
 
 use pico_args::Arguments;
 
@@ -133,6 +140,27 @@ struct IndexResponse {
     data: Vec<u8>,
 }
 
+/// Global flag to enable system native root certificates at runtime.
+#[cfg(feature = "native-certs")]
+static USE_NATIVE_CERTS: AtomicBool = AtomicBool::new(false);
+
+/// Loads system native root certificates into a rustls client config.
+#[cfg(feature = "native-certs")]
+fn load_native_certs_config() -> Arc<rustls::ClientConfig> {
+    let mut roots = rustls::RootCertStore::empty();
+    let certs = rustls_native_certs::load_native_certs()
+        .expect("failed to load system native root certificates");
+    let count = certs.len();
+    for cert in certs {
+        roots.add(cert).ok();
+    }
+    info!("native-certs: loaded {} system root certificates", count);
+    let config = rustls::ClientConfig::builder()
+        .with_root_certificates(roots)
+        .with_no_client_auth();
+    Arc::new(config)
+}
+
 /// Gets the server-global ureq client instance.
 ///
 /// The global agent instance is required to use HTTP request pipelining.
@@ -142,6 +170,11 @@ fn ureq_agent() -> ureq::Agent {
     AGENT
         .get_or_init(|| {
             let mut builder = ureq::builder().user_agent(HTTP_USER_AGENT);
+
+            #[cfg(feature = "native-certs")]
+            if USE_NATIVE_CERTS.load(Ordering::Relaxed) {
+                builder = builder.tls_config(load_native_certs_config());
+            }
 
             let proxy_url = env::var("https_proxy")
                 .or_else(|_| env::var("HTTPS_PROXY"))
@@ -639,6 +672,7 @@ fn usage() {
     println!("    -v, --verbose              print more debug info");
     println!("    -h, --help                 print help and exit");
     println!("    -V, --version              print version and exit");
+    println!("    -N, --native-certs         use system native root certificates");
     println!("    -L, --listen ADDRESS:PORT  address and port to listen at (0.0.0.0:3080)");
     println!("        --listen-unix PATH     Unix domain socket path to listen at");
     println!("    -U, --upstream-url URL     upstream download URL (https://crates.io/)");
@@ -652,6 +686,8 @@ fn usage() {
     println!("    CRATES_IO_PROXY_URL        same as --proxy-url option");
     println!("    CRATES_IO_PROXY_CACHE_DIR  same as --cache-dir option");
     println!("    CRATES_IO_PROXY_CACHE_TTL  same as --cache-ttl option");
+    println!("    https_proxy                upstream HTTPS proxy for outbound requests");
+    println!("    HTTPS_PROXY                same as https_proxy (fallback)");
 }
 
 fn main() {
@@ -682,6 +718,14 @@ fn main() {
 
     while args.contains(["-v", "--verbose"]) {
         verbose += 1;
+    }
+
+    if args.contains(["-N", "--native-certs"]) {
+        #[cfg(feature = "native-certs")]
+        USE_NATIVE_CERTS.store(true, Ordering::Relaxed);
+
+        #[cfg(not(feature = "native-certs"))]
+        warn!("native-certs support not compiled in; recompile with --features native-certs");
     }
 
     let listen_addr_unix = args

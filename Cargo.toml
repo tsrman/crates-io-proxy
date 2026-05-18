@@ -12,7 +12,7 @@ categories = ["development-tools", "caching", "web-programming::http-server"]
 readme = "README.md"
 
 [features]
-native-certs = [ "ureq/native-certs" ]
+native-certs = ["dep:rustls", "dep:rustls-native-certs"]
 
 [dependencies]
 tiny_http = "0.12"
@@ -22,6 +22,8 @@ ureq = "2.12"
 pico-args = { version = "0.5", features = ["combined-flags"] }
 log = "0.4"
 env_logger = { version = "0.11", default-features = false }
+rustls = { version = "0.23", optional = true, default-features = false, features = ["std"] }
+rustls-native-certs = { version = "0.7", optional = true }
 
 [profile.release]
 lto = true

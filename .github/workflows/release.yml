@@ -1,0 +1,38 @@
+name: Release binaries
+
+on:
+  push:
+    tags: [ v* ]
+
+env:
+  CARGO_TERM_COLOR: always
+
+jobs:
+  build-linux:
+    name: Build Linux (${{ matrix.target }})
+    runs-on: ubuntu-latest
+    strategy:
+      matrix:
+        target:
+          - x86_64-unknown-linux-gnu
+          - aarch64-unknown-linux-gnu
+    steps:
+    - uses: actions/checkout@v4
+
+    - name: Install Rust toolchain
+      uses: dtolnay/rust-toolchain@stable
+      with:
+        targets: ${{ matrix.target }}
+
+    - name: Build release
+      run: cargo build --release --features native-certs --target ${{ matrix.target }}
+
+    - name: Prepare binary
+      run: |
+        cd target/${{ matrix.target }}/release
+        mv crates-io-proxy crates-io-proxy-${{ matrix.target }}
+
+    - name: Upload to release
+      uses: softprops/action-gh-release@v2
+      with:
+        files: target/${{ matrix.target }}/release/crates-io-proxy-${{ matrix.target }}
