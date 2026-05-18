@@ -39,6 +39,37 @@ replace-with = "crates-io-mirror"
 index = "sparse+http://crates-io-proxy.example.com:3080/index/"
 ```
 
+TLS and certificates
+--------------------
+
+`crates-io-proxy` listens on plain HTTP by default (port 3080). Cargo can
+connect to it without TLS by using the `http://` scheme — this is the
+recommended setup for internal networks where the proxy runs on a trusted
+host:
+
+```
+index = "sparse+http://crates-io-proxy.example.com:3080/index/"
+```
+
+### Using a custom CA certificate
+
+If you need to serve the proxy over HTTPS with a self-signed certificate,
+Cargo does not allow disabling certificate verification. Instead, point
+Cargo to your CA certificate:
+
+In `.cargo/config.toml`:
+
+```toml
+[http]
+cainfo = "/path/to/your-ca-cert.pem"
+```
+
+Or via environment variable:
+
+```bash
+export CARGO_HTTP_CAINFO=/path/to/your-ca-cert.pem
+```
+
 Using static git index mirror
 -----------------------------
 
