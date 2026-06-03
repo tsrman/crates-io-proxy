@@ -96,6 +96,9 @@ const VERSION: &str = env!("CARGO_PKG_VERSION");
 /// HTTP client User Agent string
 const HTTP_USER_AGENT: &str = concat!("crates-io-proxy/", env!("CARGO_PKG_VERSION"));
 
+/// Optional additional CA certificate path for TLS connections.
+static CA_CERT_PATH: OnceLock<Option<PathBuf>> = OnceLock::new();
+
 /// Proxy server configuration
 #[derive(Debug, Clone)]
 struct ProxyConfig {
@@ -156,7 +159,7 @@ fn reqwest_client() -> reqwest::blocking::Client {
 
     CLIENT
         .get_or_init(|| {
-            let builder = reqwest::blocking::Client::builder()
+            let mut builder = reqwest::blocking::Client::builder()
                 .user_agent(HTTP_USER_AGENT)
                 .timeout(Duration::from_secs(60));
 
@@ -168,6 +171,14 @@ fn reqwest_client() -> reqwest::blocking::Client {
             #[cfg(not(feature = "native-certs"))]
             {
                 debug!("fetch: using embedded webpki root certificates");
+            }
+
+            if let Some(ca_path) = CA_CERT_PATH.get().and_then(|p| p.as_ref()) {
+                info!("fetch: loading additional CA certificate from: {}", ca_path.display());
+                let ca_data = std::fs::read(ca_path).expect("failed to read CA certificate file");
+                let cert = reqwest::Certificate::from_pem(&ca_data)
+                    .expect("invalid CA certificate PEM format");
+                builder = builder.add_root_certificate(cert);
             }
 
             builder.build().expect("failed to build HTTP client")
@@ -200,7 +211,9 @@ fn download_crate(site_url: &Url, crate_info: &CrateInfo) -> Result<Vec<u8>, Fet
     }
 
     if !status.is_success() {
-        let body = response.text().unwrap_or_else(|_| "Unknown error".to_string());
+        let body = response
+            .text()
+            .unwrap_or_else(|_| "Unknown error".to_string());
         warn!("fetch: upstream returned HTTP {status}: {body}");
         return Err(FetchError::Http(status.as_u16(), body));
     }
@@ -210,10 +223,16 @@ fn download_crate(site_url: &Url, crate_info: &CrateInfo) -> Result<Vec<u8>, Fet
         .map_err(|e| FetchError::Transport(e.to_string()))?
         .to_vec();
 
-    debug!("fetch: downloaded crate {crate_info}, size: {} bytes", data.len());
+    debug!(
+        "fetch: downloaded crate {crate_info}, size: {} bytes",
+        data.len()
+    );
 
     if data.len() > MAX_CRATE_SIZE {
-        error!("fetch: crate {crate_info} size {} exceeds maximum {MAX_CRATE_SIZE}", data.len());
+        error!(
+            "fetch: crate {crate_info} size {} exceeds maximum {MAX_CRATE_SIZE}",
+            data.len()
+        );
         return Err(FetchError::Http(507, "Insufficient storage".to_string()));
     }
 
@@ -243,7 +262,9 @@ fn download_index_entry(
         debug!("fetch: no cache headers for index entry {entry}");
     }
 
-    let response = request.send().map_err(|e| FetchError::Transport(e.to_string()))?;
+    let response = request
+        .send()
+        .map_err(|e| FetchError::Transport(e.to_string()))?;
 
     let status = response.status();
     debug!("fetch: upstream response status for index entry {entry}: {status}");
@@ -258,7 +279,11 @@ fn download_index_entry(
         debug!("fetch: upstream ETag for index entry {entry}: {etag}");
         entry.set_etag(etag);
     }
-    if let Some(last_modified) = response.headers().get("last-modified").and_then(|v| v.to_str().ok()) {
+    if let Some(last_modified) = response
+        .headers()
+        .get("last-modified")
+        .and_then(|v| v.to_str().ok())
+    {
         debug!("fetch: upstream Last-Modified for index entry {entry}: {last_modified}");
         entry.set_last_modified(last_modified);
     }
@@ -270,7 +295,9 @@ fn download_index_entry(
         // No body for 304 Not Modified
         Vec::new()
     } else if !status.is_success() {
-        let body = response.text().unwrap_or_else(|_| "Unknown error".to_string());
+        let body = response
+            .text()
+            .unwrap_or_else(|_| "Unknown error".to_string());
         warn!("fetch: upstream returned HTTP {status}: {body}");
         return Err(FetchError::Http(status.as_u16(), body));
     } else {
@@ -280,7 +307,10 @@ fn download_index_entry(
             .to_vec()
     };
 
-    debug!("fetch: downloaded index entry {entry}, size: {} bytes", data.len());
+    debug!(
+        "fetch: downloaded index entry {entry}, size: {} bytes",
+        data.len()
+    );
 
     Ok(IndexResponse {
         entry,
@@ -305,7 +335,10 @@ fn send_error_response(request: Request, code: u16) {
 
 /// Sends a generic JSON-encoded HTTP response.
 fn send_json_response(request: Request, code: u16, json: String) {
-    debug!("proxy: sending JSON response: HTTP {code}, body: {} bytes", json.len());
+    debug!(
+        "proxy: sending JSON response: HTTP {code}, body: {} bytes",
+        json.len()
+    );
     trace!("proxy: JSON body: {json}");
     let content_type = JSON_HTTP_CTYPE.parse::<Header>().unwrap();
 
@@ -318,7 +351,10 @@ fn send_json_response(request: Request, code: u16, json: String) {
 
 /// Sends the crate data download response.
 fn send_crate_data_response(request: Request, data: Vec<u8>) {
-    debug!("proxy: sending crate data response: HTTP 200, {} bytes", data.len());
+    debug!(
+        "proxy: sending crate data response: HTTP 200, {} bytes",
+        data.len()
+    );
     let content_type = CRATE_HTTP_CTYPE.parse::<Header>().unwrap();
     let response = Response::from_data(data).with_header(content_type);
 
@@ -345,7 +381,11 @@ fn set_index_response_headers<R: Read>(
 
 /// Sends the registry index entry download response.
 fn send_index_entry_data_response(request: Request, index_response: IndexResponse) {
-    debug!("proxy: sending index entry data response: HTTP {}, {} bytes", index_response.status, index_response.data.len());
+    debug!(
+        "proxy: sending index entry data response: HTTP {}, {} bytes",
+        index_response.status,
+        index_response.data.len()
+    );
     let content_type = INDEX_HTTP_CTYPE.parse::<Header>().unwrap();
     let mut response = Response::from_data(index_response.data)
         .with_status_code(index_response.status)
@@ -361,7 +401,10 @@ fn send_index_entry_data_response(request: Request, index_response: IndexRespons
 fn send_index_entry_file_response(request: Request, entry: IndexEntry, data: Vec<u8>) {
     // HTTP 200 OK
     let status = 200;
-    debug!("proxy: sending cached index file response for {entry}: HTTP {status}, {} bytes", data.len());
+    debug!(
+        "proxy: sending cached index file response for {entry}: HTTP {status}, {} bytes",
+        data.len()
+    );
 
     let response = IndexResponse {
         entry,
@@ -413,7 +456,10 @@ fn forward_download_request(request: Request, crate_info: CrateInfo, config: Pro
 
     let thread_proc = move || match download_crate(&config.upstream_url, &crate_info) {
         Ok(data) => {
-            info!("fetch: successfully downloaded {crate_info}, caching {} bytes", data.len());
+            info!(
+                "fetch: successfully downloaded {crate_info}, caching {} bytes",
+                data.len()
+            );
             cache_store_crate(&config.crates_dir, &crate_info, &data);
             send_crate_data_response(request, data);
         }
@@ -450,14 +496,24 @@ fn forward_index_request(
 
     let thread_proc = move || match download_index_entry(&config.index_url, req_entry) {
         Ok(response) => {
-            debug!("proxy: upstream response for {entry}: status={}, data_len={}", response.status, response.data.len());
+            debug!(
+                "proxy: upstream response for {entry}: status={}, data_len={}",
+                response.status,
+                response.data.len()
+            );
 
             // Check for HTTP 200 or HTTP 304 statuses.
             if response.status == 200 {
-                info!("fetch: successfully got index entry for {entry}, caching {} bytes", response.data.len());
+                info!(
+                    "fetch: successfully got index entry for {entry}, caching {} bytes",
+                    response.data.len()
+                );
                 cache_store_index_entry(&config.index_dir, &response.entry, &response.data);
             } else {
-                debug!("fetch: cached index entry for {entry} is up to date (upstream returned {})", response.status);
+                debug!(
+                    "fetch: cached index entry for {entry} is up to date (upstream returned {})",
+                    response.status
+                );
             }
 
             metadata_store_index_entry(&response.entry);
@@ -468,13 +524,19 @@ fn forward_index_request(
                 send_index_entry_not_modified_response(request, &response.entry);
             } else if response.status == 200 {
                 // Upstream registry sent us updated index entry data.
-                debug!("proxy: forwarding new index data for {entry}, size: {} bytes", response.data.len());
+                debug!(
+                    "proxy: forwarding new index data for {entry}, size: {} bytes",
+                    response.data.len()
+                );
                 send_index_entry_data_response(request, response);
             } else if let Some(data) = cache_fetch_index_entry(&config.index_dir, &entry) {
                 // Upstream registry sent us 304 Not Modified,
                 // but the client does not have this file cached.
                 // Fetch the index entry file from the local filesystem cache.
-                debug!("proxy: forwarding cached index file data for {entry}, size: {} bytes", data.len());
+                debug!(
+                    "proxy: forwarding cached index file data for {entry}, size: {} bytes",
+                    data.len()
+                );
                 send_index_entry_file_response(request, response.entry, data);
             } else {
                 // Something went very wrong with the local filesystem cache.
@@ -525,7 +587,10 @@ fn handle_download_request(request: Request, crate_url: &str, config: &ProxyConf
     debug!("proxy: parsed crate info: {crate_info}");
 
     if let Some(data) = cache_fetch_crate(&config.crates_dir, &crate_info) {
-        info!("proxy: local cache hit for {crate_info}, size: {} bytes", data.len());
+        info!(
+            "proxy: local cache hit for {crate_info}, size: {} bytes",
+            data.len()
+        );
         send_crate_data_response(request, data);
     } else {
         info!("proxy: local cache miss for {crate_info}, forwarding to upstream");
@@ -573,7 +638,9 @@ fn handle_index_request(request: Request, index_url: &str, config: &ProxyConfig)
         debug!("proxy: found metadata cache for {index_entry}");
         // Expired cache entries require a new request to the upstream registry.
         if cached_entry.is_expired_with_ttl(&config.cache_ttl) {
-            info!("proxy: index metadata cache expired for {index_entry}, refreshing from upstream");
+            info!(
+                "proxy: index metadata cache expired for {index_entry}, refreshing from upstream"
+            );
             forward_index_request(request, index_entry, Some(cached_entry), config.clone());
             return;
         }
@@ -587,7 +654,10 @@ fn handle_index_request(request: Request, index_url: &str, config: &ProxyConfig)
 
         // Check for the index file cache hit next.
         if let Some(data) = cache_fetch_index_entry(&config.index_dir, &index_entry) {
-            info!("proxy: index file cache hit for {index_entry}, size: {} bytes", data.len());
+            info!(
+                "proxy: index file cache hit for {index_entry}, size: {} bytes",
+                data.len()
+            );
             send_index_entry_file_response(request, cached_entry, data);
             return;
         }
@@ -683,7 +753,10 @@ fn main_loop(listen_addr: &ListenAddress, config: &ProxyConfig) -> ! {
     // Main HTTP request accept loop.
     loop {
         let request = server.recv().expect("failed to accept new HTTP requests");
-        let client_addr = request.remote_addr().map(|a| a.to_string()).unwrap_or_else(|| "unknown".to_string());
+        let client_addr = request
+            .remote_addr()
+            .map(|a| a.to_string())
+            .unwrap_or_else(|| "unknown".to_string());
 
         trace!("proxy: accepted connection from {client_addr}");
 
@@ -729,11 +802,13 @@ fn usage() {
     println!("    -S, --proxy-url URL        this proxy server URL (http://localhost:3080/)");
     println!("    -C, --cache-dir DIR        proxy cache directory (/var/cache/crates-io-proxy)");
     println!("    -T, --cache-ttl SECONDS    index cache entry Time-to-Live in seconds (3600)");
+    println!("    -A, --ca-cert PATH         additional CA certificate PEM file for TLS");
     println!("\nEnvironment:");
     println!("    INDEX_CRATES_IO_URL        same as --index-url option");
     println!("    CRATES_IO_URL              same as --upstream-url option");
     println!("    CRATES_IO_PROXY_URL        same as --proxy-url option");
     println!("    CRATES_IO_PROXY_CACHE_DIR  same as --cache-dir option");
+    println!("    CRATES_IO_PROXY_CA_CERT    same as --ca-cert option");
     println!("    CRATES_IO_PROXY_CACHE_TTL  same as --cache-ttl option");
     println!("    https_proxy                upstream HTTPS proxy for outbound requests");
     println!("    HTTPS_PROXY                same as https_proxy (fallback)");
@@ -811,6 +886,21 @@ fn main() {
         .expect("bad cache TTL argument")
         .unwrap_or(default_cache_ttl_secs);
 
+    let ca_cert: Option<PathBuf> = args
+        .opt_value_from_str(["-A", "--ca-cert"])
+        .expect("bad CA certificate path argument")
+        .or_else(|| env::var("CRATES_IO_PROXY_CA_CERT").ok().map(PathBuf::from));
+
+    if let Some(ref ca_path) = ca_cert {
+        info!(
+            "config: using additional CA certificate: {}",
+            ca_path.display()
+        );
+    }
+
+    // Store the CA certificate path for the global HTTP client.
+    CA_CERT_PATH.set(ca_cert).ok();
+
     let loglevel = match verbose {
         0 => "warn",
         1 => "info",
@@ -821,7 +911,17 @@ fn main() {
     LogBuilder::from_env(LogEnv::new().default_filter_or(loglevel)).init();
 
     // Log all proxy-related environment variables for debugging
-    for env_name in ["http_proxy", "HTTP_PROXY", "https_proxy", "HTTPS_PROXY", "ALL_PROXY", "all_proxy", "no_proxy", "NO_PROXY"] {
+    for env_name in [
+        "http_proxy",
+        "HTTP_PROXY",
+        "https_proxy",
+        "HTTPS_PROXY",
+        "ALL_PROXY",
+        "all_proxy",
+        "no_proxy",
+        "NO_PROXY",
+        "CRATES_IO_PROXY_CA_CERT",
+    ] {
         if let Ok(val) = env::var(env_name) {
             info!("env: {env_name}={val}");
         }

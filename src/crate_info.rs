@@ -52,7 +52,10 @@ impl CrateInfo {
                 Some(CrateInfo::new(name, version))
             }
             other => {
-                debug!("crate_info: failed to parse download URL '{url}': unexpected segments: {:?}", other);
+                debug!(
+                    "crate_info: failed to parse download URL '{url}': unexpected segments: {:?}",
+                    other
+                );
                 None
             }
         };

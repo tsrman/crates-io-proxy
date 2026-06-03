@@ -51,26 +51,30 @@ impl IndexEntry {
         let mut i = url.split('/');
 
         let result = match i.next() {
-            Some("1" | "2") => match (i.next(), i.next()) {
-                (Some(name), None) => {
-                    debug!("index_entry: parsed short name (1-2 chars): '{name}' from '{url}'");
-                    Some(IndexEntry::new(name))
+            Some("1" | "2") => {
+                match (i.next(), i.next()) {
+                    (Some(name), None) => {
+                        debug!("index_entry: parsed short name (1-2 chars): '{name}' from '{url}'");
+                        Some(IndexEntry::new(name))
+                    }
+                    other => {
+                        debug!("index_entry: failed to parse short URL '{url}': unexpected segments: {:?}", other);
+                        None
+                    }
                 }
-                other => {
-                    debug!("index_entry: failed to parse short URL '{url}': unexpected segments: {:?}", other);
-                    None
+            }
+            _ => {
+                match (i.next(), i.next(), i.next()) {
+                    (Some(_), Some(name), None) => {
+                        debug!("index_entry: parsed long name: '{name}' from '{url}'");
+                        Some(IndexEntry::new(name))
+                    }
+                    other => {
+                        debug!("index_entry: failed to parse long URL '{url}': unexpected segments: {:?}", other);
+                        None
+                    }
                 }
-            },
-            _ => match (i.next(), i.next(), i.next()) {
-                (Some(_), Some(name), None) => {
-                    debug!("index_entry: parsed long name: '{name}' from '{url}'");
-                    Some(IndexEntry::new(name))
-                }
-                other => {
-                    debug!("index_entry: failed to parse long URL '{url}': unexpected segments: {:?}", other);
-                    None
-                }
-            },
+            }
         };
 
         if result.is_none() {
