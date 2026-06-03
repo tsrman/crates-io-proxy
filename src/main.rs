@@ -45,7 +45,7 @@ use std::sync::Arc;
 use pico_args::Arguments;
 
 use env_logger::{Builder as LogBuilder, Env as LogEnv};
-use log::{debug, error, info, warn};
+use log::{debug, error, info, trace, warn};
 
 use tiny_http::{Header, Method, Request, Response, Server};
 use url::Url;
@@ -173,6 +173,7 @@ fn ureq_agent() -> ureq::Agent {
 
             #[cfg(feature = "native-certs")]
             if USE_NATIVE_CERTS.load(Ordering::Relaxed) {
+                info!("fetch: using system native root certificates");
                 builder = builder.tls_config(load_native_certs_config());
             }
 
@@ -180,10 +181,19 @@ fn ureq_agent() -> ureq::Agent {
                 .or_else(|_| env::var("HTTPS_PROXY"))
                 .ok();
 
-            if let Some(url) = proxy_url {
-                if let Ok(proxy) = ureq::Proxy::new(url) {
-                    builder = builder.proxy(proxy);
+            if let Some(ref url) = proxy_url {
+                info!("fetch: detected https_proxy environment variable: {url}");
+                match ureq::Proxy::new(url) {
+                    Ok(proxy) => {
+                        info!("fetch: using upstream HTTPS proxy: {url}");
+                        builder = builder.proxy(proxy);
+                    }
+                    Err(e) => {
+                        warn!("fetch: failed to parse https_proxy '{url}': {e}");
+                    }
                 }
+            } else {
+                debug!("fetch: no https_proxy environment variable set");
             }
 
             builder.build()
@@ -210,17 +220,30 @@ fn download_crate(site_url: &Url, crate_info: &CrateInfo) -> Result<Vec<u8>, Box
         .join(&crate_info.to_download_url())
         .unwrap();
 
+    debug!("fetch: downloading crate from upstream: {url}");
+
     let response = ureq_agent()
         .request_url("GET", &url)
         .call()
         .map_err(Box::new)?;
 
+    let status = response.status();
+    debug!("fetch: upstream response status for crate {crate_info}: {status}");
+
+    trace!("fetch: upstream response headers for crate {crate_info}:");
+    for h in response.headers_names().iter().filter_map(|name| response.header(name).map(|v| (name, v))) {
+        trace!("fetch:   {}: {}", h.0, h.1);
+    }
+
     if let Some(content_len) = response.header("Content-Length") {
+        debug!("fetch: upstream Content-Length for crate {crate_info}: {content_len}");
         let Ok(len) = content_len.parse::<usize>() else {
+            error!("fetch: invalid Content-Length header from upstream for crate {crate_info}: '{content_len}'");
             return Err(ureq_status_error(400, "Invalid header"));
         };
 
         if len > MAX_CRATE_SIZE {
+            error!("fetch: crate {crate_info} size {len} exceeds maximum {MAX_CRATE_SIZE}");
             return Err(ureq_status_error(507, "Insufficient storage"));
         }
 
@@ -230,12 +253,14 @@ fn download_crate(site_url: &Url, crate_info: &CrateInfo) -> Result<Vec<u8>, Box
             .read_to_end(&mut data)
             .map_err(|e| Box::new(e.into()))?;
 
+        debug!("fetch: downloaded crate {crate_info}, size: {} bytes", data.len());
         Ok(data)
     } else {
         // Got no "Content-Length" header, most likely because "Transfer-Encoding: chunked"
         // is being sent by the server (crates.io servers do not do this).
         //
         // Using an arbitrary initial estimate for the total response size...
+        debug!("fetch: no Content-Length header for crate {crate_info}, using chunked reader");
         let mut data: Vec<u8> = Vec::with_capacity(MAX_CRATE_SIZE / 256);
 
         response
@@ -247,9 +272,11 @@ fn download_crate(site_url: &Url, crate_info: &CrateInfo) -> Result<Vec<u8>, Box
         // Abort download here if the crate file has been truncated by
         // the `reader.take()` limit above.
         if data.len() >= MAX_CRATE_SIZE {
+            error!("fetch: crate {crate_info} exceeds maximum size {MAX_CRATE_SIZE}");
             return Err(ureq_status_error(507, "Insufficient storage"));
         }
 
+        debug!("fetch: downloaded crate {crate_info} (chunked), size: {} bytes", data.len());
         Ok(data)
     }
 }
@@ -262,24 +289,38 @@ fn download_index_entry(
 ) -> Result<IndexResponse, Box<ureq::Error>> {
     let url = index_url.join(&entry.to_index_url()).unwrap();
 
+    debug!("fetch: downloading index entry from upstream: {url}");
+
     let mut request = ureq_agent().request_url("GET", &url);
 
     // Add cache control headers to all index requests.
     if let Some(etag) = entry.etag() {
+        debug!("fetch: sending If-None-Match: {etag} for index entry {entry}");
         request = request.set("If-None-Match", etag);
     } else if let Some(last_modified) = entry.last_modified() {
+        debug!("fetch: sending If-Modified-Since: {last_modified} for index entry {entry}");
         request = request.set("If-Modified-Since", &last_modified);
+    } else {
+        debug!("fetch: no cache headers for index entry {entry}");
     }
 
     let response = request.call().map_err(Box::new)?;
 
     let status = response.status();
+    debug!("fetch: upstream response status for index entry {entry}: {status}");
+
+    trace!("fetch: upstream response headers for index entry {entry}:");
+    for h in response.headers_names().iter().filter_map(|name| response.header(name).map(|v| (name, v))) {
+        trace!("fetch:   {}: {}", h.0, h.1);
+    }
 
     // Update the index entry metadata from the upstream response.
     if let Some(etag) = response.header("ETag") {
+        debug!("fetch: upstream ETag for index entry {entry}: {etag}");
         entry.set_etag(etag);
     }
     if let Some(last_modified) = response.header("Last-Modified") {
+        debug!("fetch: upstream Last-Modified for index entry {entry}: {last_modified}");
         entry.set_last_modified(last_modified);
     }
 
@@ -291,6 +332,8 @@ fn download_index_entry(
         .into_reader()
         .read_to_end(&mut data)
         .map_err(|e| Box::new(e.into()))?;
+
+    debug!("fetch: downloaded index entry {entry}, size: {} bytes", data.len());
 
     Ok(IndexResponse {
         entry,
@@ -307,6 +350,7 @@ fn log_send_error(error: std::io::Error) {
 
 /// Sends an empty HTTP error response.
 fn send_error_response(request: Request, code: u16) {
+    debug!("proxy: sending HTTP error response: {code}");
     request
         .respond(Response::empty(code))
         .unwrap_or_else(log_send_error);
@@ -314,6 +358,8 @@ fn send_error_response(request: Request, code: u16) {
 
 /// Sends a generic JSON-encoded HTTP response.
 fn send_json_response(request: Request, code: u16, json: String) {
+    debug!("proxy: sending JSON response: HTTP {code}, body: {} bytes", json.len());
+    trace!("proxy: JSON body: {json}");
     let content_type = JSON_HTTP_CTYPE.parse::<Header>().unwrap();
 
     let response = Response::from_string(json)
@@ -325,6 +371,7 @@ fn send_json_response(request: Request, code: u16, json: String) {
 
 /// Sends the crate data download response.
 fn send_crate_data_response(request: Request, data: Vec<u8>) {
+    debug!("proxy: sending crate data response: HTTP 200, {} bytes", data.len());
     let content_type = CRATE_HTTP_CTYPE.parse::<Header>().unwrap();
     let response = Response::from_data(data).with_header(content_type);
 
@@ -351,6 +398,7 @@ fn set_index_response_headers<R: Read>(
 
 /// Sends the registry index entry download response.
 fn send_index_entry_data_response(request: Request, index_response: IndexResponse) {
+    debug!("proxy: sending index entry data response: HTTP {}, {} bytes", index_response.status, index_response.data.len());
     let content_type = INDEX_HTTP_CTYPE.parse::<Header>().unwrap();
     let mut response = Response::from_data(index_response.data)
         .with_status_code(index_response.status)
@@ -366,6 +414,7 @@ fn send_index_entry_data_response(request: Request, index_response: IndexRespons
 fn send_index_entry_file_response(request: Request, entry: IndexEntry, data: Vec<u8>) {
     // HTTP 200 OK
     let status = 200;
+    debug!("proxy: sending cached index file response for {entry}: HTTP {status}, {} bytes", data.len());
 
     let response = IndexResponse {
         entry,
@@ -378,6 +427,7 @@ fn send_index_entry_file_response(request: Request, entry: IndexEntry, data: Vec
 
 /// Sends the registry index entry HTTP 304 Not Modified response.
 fn send_index_entry_not_modified_response(request: Request, entry: &IndexEntry) {
+    debug!("proxy: sending 304 Not Modified for index entry {entry}");
     let mut response = Response::empty(304);
     response = set_index_response_headers(response, entry);
     request.respond(response).unwrap_or_else(log_send_error);
@@ -391,6 +441,7 @@ fn format_json_error(error: impl Display) -> String {
 
 /// Sends the HTTP error response from an ureq client error.
 fn send_fetch_error_response(request: Request, error: Box<ureq::Error>) {
+    error!("proxy: forwarding upstream error to client: {error}");
     match *error {
         // Forward the HTTP error status received from the upstream server.
         ureq::Error::Status(code, response) => {
@@ -412,14 +463,18 @@ fn send_fetch_error_response(request: Request, error: Box<ureq::Error>) {
 /// Processes the download request in a dedicated thread.
 fn forward_download_request(request: Request, crate_info: CrateInfo, config: ProxyConfig) {
     let thread_name = format!("worker-fetch-crate-{}", crate_info.name());
+    info!("proxy: spawning thread '{thread_name}' to download {crate_info} from upstream");
 
     let thread_proc = move || match download_crate(&config.upstream_url, &crate_info) {
         Ok(data) => {
-            info!("fetch: successfully downloaded {crate_info}");
+            info!("fetch: successfully downloaded {crate_info}, caching {} bytes", data.len());
             cache_store_crate(&config.crates_dir, &crate_info, &data);
             send_crate_data_response(request, data);
         }
-        Err(err) => send_fetch_error_response(request, err),
+        Err(err) => {
+            error!("fetch: failed to download {crate_info}: {err}");
+            send_fetch_error_response(request, err);
+        }
     };
 
     std::thread::Builder::new()
@@ -441,45 +496,50 @@ fn forward_index_request(
     config: ProxyConfig,
 ) {
     let thread_name = format!("worker-fetch-index-{entry}");
+    info!("proxy: spawning thread '{thread_name}' to fetch index entry {entry} from upstream");
 
     // Select where the new HTTP request headers will come from.
     let req_entry = cached_entry.unwrap_or_else(|| entry.clone());
+    debug!("proxy: using cached entry metadata for upstream request: {req_entry}");
 
     let thread_proc = move || match download_index_entry(&config.index_url, req_entry) {
         Ok(response) => {
+            debug!("proxy: upstream response for {entry}: status={}, data_len={}", response.status, response.data.len());
+
             // Check for HTTP 200 or HTTP 304 statuses.
             if response.status == 200 {
-                info!("fetch: successfully got index entry for {entry}");
+                info!("fetch: successfully got index entry for {entry}, caching {} bytes", response.data.len());
                 cache_store_index_entry(&config.index_dir, &response.entry, &response.data);
             } else {
-                debug!("fetch: cached index entry for {entry} is up to date");
+                debug!("fetch: cached index entry for {entry} is up to date (upstream returned {})", response.status);
             }
 
             metadata_store_index_entry(&response.entry);
 
             if response.entry.is_equivalent(&entry) {
                 // Updated index entry file metadata matches that of the client request.
-                debug!("proxy: forwarding the up to date status for {entry}");
+                debug!("proxy: client cache is up to date for {entry}, sending 304");
                 send_index_entry_not_modified_response(request, &response.entry);
             } else if response.status == 200 {
                 // Upstream registry sent us updated index entry data.
-                debug!("proxy: forwarding new index data for {entry}");
+                debug!("proxy: forwarding new index data for {entry}, size: {} bytes", response.data.len());
                 send_index_entry_data_response(request, response);
             } else if let Some(data) = cache_fetch_index_entry(&config.index_dir, &entry) {
                 // Upstream registry sent us 304 Not Modified,
                 // but the client does not have this file cached.
                 // Fetch the index entry file from the local filesystem cache.
-                debug!("proxy: forwarding cached index data for {entry}");
+                debug!("proxy: forwarding cached index file data for {entry}, size: {} bytes", data.len());
                 send_index_entry_file_response(request, response.entry, data);
             } else {
                 // Something went very wrong with the local filesystem cache.
-                error!("cache: lost index cache file for {entry}");
+                error!("cache: lost index cache file for {entry} after upstream 304");
                 // Invalidate the volatile metadata cache and ask the client to retry.
                 metadata_invalidate_index_entry(&entry);
                 send_error_response(request, 503);
             }
         }
         Err(err) => {
+            error!("fetch: failed to download index entry {entry}: {err}");
             if let ureq::Error::Transport(err) = err.as_ref() {
                 if let Some(data) = cache_fetch_index_entry(&config.index_dir, &entry) {
                     error!("fetch: index connection failed: {err}");
@@ -488,7 +548,7 @@ fn forward_index_request(
                     // due to an intermittent network failure.
                     // Serve a possibly stale index entry file from the local filesystem
                     // cache anyway to keep the clients running.
-                    warn!("proxy: forwarding possibly stale cached index data for {entry}");
+                    warn!("proxy: forwarding possibly stale cached index data for {entry}, size: {} bytes", data.len());
 
                     send_index_entry_file_response(request, entry, data);
                     return;
@@ -508,48 +568,55 @@ fn forward_index_request(
 
 /// Processes one crate download API request.
 fn handle_download_request(request: Request, crate_url: &str, config: &ProxyConfig) {
+    debug!("proxy: processing download request for: {crate_url}");
+
     let Some(crate_info) = CrateInfo::try_from_download_url(crate_url) else {
-        warn!("proxy: unrecognized download API endpoint: {crate_url}");
+        warn!("proxy: unrecognized download API endpoint: '{crate_url}'");
         send_error_response(request, 404);
         return;
     };
 
-    debug!("proxy: download API endpoint hit: {crate_url}");
+    debug!("proxy: parsed crate info: {crate_info}");
 
     if let Some(data) = cache_fetch_crate(&config.crates_dir, &crate_info) {
-        debug!("proxy: local cache hit for {crate_info}");
+        info!("proxy: local cache hit for {crate_info}, size: {} bytes", data.len());
         send_crate_data_response(request, data);
     } else {
+        info!("proxy: local cache miss for {crate_info}, forwarding to upstream");
         forward_download_request(request, crate_info, config.clone());
     }
 }
 
 /// Processes one sparse registry index API request.
 fn handle_index_request(request: Request, index_url: &str, config: &ProxyConfig) {
+    debug!("proxy: processing index request for: '{index_url}'");
+
     if is_config_json_url(index_url) {
-        debug!("proxy: sending registry config file");
-        send_json_response(request, 200, gen_config_json_file(config));
+        debug!("proxy: config.json requested, sending generated config");
+        let config_json = gen_config_json_file(config);
+        trace!("proxy: generated config.json: {config_json}");
+        send_json_response(request, 200, config_json);
         return;
     }
 
     let Some(mut index_entry) = IndexEntry::try_from_index_url(index_url) else {
-        warn!("proxy: malformed registry index path: {index_url}");
+        warn!("proxy: malformed registry index path: '{index_url}'");
         send_error_response(request, 404);
         return;
     };
 
-    debug!("proxy: requesting index entry for {index_entry}");
+    debug!("proxy: parsed index entry: {index_entry}");
 
     // Extract cache control headers from all index requests.
     for header in request.headers() {
         if header.field.equiv("If-None-Match") {
             let etag = header.value.as_str();
-            debug!("proxy: checking known index entry {index_entry} with ETag: {etag}");
+            debug!("proxy: client sent If-None-Match for {index_entry}: {etag}");
             index_entry.set_etag(etag);
         }
         if header.field.equiv("If-Modified-Since") {
             let last_modified = header.value.as_str();
-            debug!("proxy: checking known index entry {index_entry} with Last-Modified: {last_modified}");
+            debug!("proxy: client sent If-Modified-Since for {index_entry}: {last_modified}");
             index_entry.set_last_modified(last_modified);
         }
     }
@@ -557,26 +624,30 @@ fn handle_index_request(request: Request, index_url: &str, config: &ProxyConfig)
     // Try to serve the request from the local index cache first.
     // NOTE: The index file cache can not be used without matching metadata.
     if let Some(cached_entry) = metadata_fetch_index_entry(index_entry.name()) {
+        debug!("proxy: found metadata cache for {index_entry}");
         // Expired cache entries require a new request to the upstream registry.
         if cached_entry.is_expired_with_ttl(&config.cache_ttl) {
-            info!("proxy: index cache expired for {index_entry}, refreshing...");
+            info!("proxy: index metadata cache expired for {index_entry}, refreshing from upstream");
             forward_index_request(request, index_entry, Some(cached_entry), config.clone());
             return;
         }
 
         // Check for the index metadata cache hit via ETag and Last-Modified fields.
         if cached_entry.is_equivalent(&index_entry) {
-            debug!("proxy: index metadata cache hit for {index_entry}");
+            debug!("proxy: index metadata cache hit (ETag/Last-Modified match) for {index_entry}");
             send_index_entry_not_modified_response(request, &cached_entry);
             return;
         }
 
         // Check for the index file cache hit next.
         if let Some(data) = cache_fetch_index_entry(&config.index_dir, &index_entry) {
-            debug!("proxy: index data cache hit for {index_entry}");
+            info!("proxy: index file cache hit for {index_entry}, size: {} bytes", data.len());
             send_index_entry_file_response(request, cached_entry, data);
             return;
         }
+        debug!("proxy: index file cache miss for {index_entry} (metadata exists but file missing)");
+    } else {
+        debug!("proxy: no metadata cache for {index_entry}");
     }
 
     // Try to recreate the index entry metadata from the cached file mtime.
@@ -584,13 +655,15 @@ fn handle_index_request(request: Request, index_url: &str, config: &ProxyConfig)
 
     if let Some(entry) = &mtimed_entry {
         let last_modified = entry.last_modified().unwrap();
-
         info!(
-            "proxy: recreated index cache metadata for {entry} with Last-Modified: {last_modified}"
+            "proxy: recreated index cache metadata from file mtime for {entry} with Last-Modified: {last_modified}"
         );
+    } else {
+        debug!("proxy: no cached index file found for {index_entry}");
     }
 
     // Fall back to forwarding the request to the upstream registry.
+    info!("proxy: forwarding index request for {index_entry} to upstream");
     forward_index_request(request, index_entry, mtimed_entry, config.clone());
 }
 
@@ -598,14 +671,41 @@ fn handle_index_request(request: Request, index_url: &str, config: &ProxyConfig)
 ///
 /// Only registry index and download API requests are supported.
 fn handle_get_request(request: Request, config: &ProxyConfig) {
-    let url = request.url().to_owned();
+    let mut url = request.url().to_owned();
+    let method = request.method().to_string();
+
+    trace!("proxy: incoming request: {method} {url}");
+    trace!("proxy: request headers:");
+    for header in request.headers() {
+        trace!("proxy:   {}: {}", header.field, header.value);
+    }
+
+    // Handle absolute URI requests that may come via corporate HTTP proxies.
+    // e.g. "GET http://host:3080/index/config.json HTTP/1.1"
+    if url.contains("://") {
+        if let Some(path_start) = url.find('/') {
+            // Skip "http://" or "https://" to find the host, then skip host to find the path
+            let after_scheme = &url[path_start + 2..]; // after "//"
+            if let Some(path_idx) = after_scheme.find('/') {
+                let extracted_path = &after_scheme[path_idx..];
+                debug!("proxy: detected absolute URI, extracting path: '{extracted_path}' from '{url}'");
+                url = extracted_path.to_string();
+            } else {
+                warn!("proxy: absolute URI without path: '{url}'");
+                send_error_response(request, 404);
+                return;
+            }
+        }
+    }
 
     if let Some(index_url) = url.strip_prefix(CRATES_INDEX_PATH) {
+        debug!("proxy: routing to index handler: '{index_url}'");
         handle_index_request(request, index_url, config);
     } else if let Some(crate_url) = url.strip_prefix(CRATES_API_PATH) {
+        debug!("proxy: routing to download handler: '{crate_url}'");
         handle_download_request(request, crate_url, config);
     } else {
-        warn!("proxy: unknown index or download API path: {url}");
+        warn!("proxy: unknown index or download API path: '{url}'");
         send_error_response(request, 404);
     };
 }
@@ -637,11 +737,14 @@ fn main_loop(listen_addr: &ListenAddress, config: &ProxyConfig) -> ! {
     // Main HTTP request accept loop.
     loop {
         let request = server.recv().expect("failed to accept new HTTP requests");
+        let client_addr = request.remote_addr().map(|a| a.to_string()).unwrap_or_else(|| "unknown".to_string());
+
+        trace!("proxy: accepted connection from {client_addr}");
 
         // Forbid non-downloading HTTP methods.
         if *request.method() != Method::Get {
             warn!(
-                "proxy: unexpected download API method: {}",
+                "proxy: unexpected download API method: {} from {client_addr}",
                 request.method()
             );
             send_error_response(request, 403);
@@ -770,6 +873,13 @@ fn main() {
     };
 
     LogBuilder::from_env(LogEnv::new().default_filter_or(loglevel)).init();
+
+    // Log all proxy-related environment variables for debugging
+    for env_name in ["http_proxy", "HTTP_PROXY", "https_proxy", "HTTPS_PROXY", "ALL_PROXY", "all_proxy", "no_proxy", "NO_PROXY"] {
+        if let Ok(val) = env::var(env_name) {
+            info!("env: {env_name}={val}");
+        }
+    }
 
     let index_url = Url::parse(&index_url_string).expect("invalid upstream URL format");
 

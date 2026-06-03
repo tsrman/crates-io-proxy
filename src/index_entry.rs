@@ -5,6 +5,7 @@ use std::path::PathBuf;
 use std::time::{Duration, Instant, SystemTime};
 
 use httpdate::{fmt_http_date, parse_http_date};
+use log::{debug, trace};
 
 /// Registry index entry structure
 #[derive(Clone, Debug, PartialEq, Eq, PartialOrd, Ord)]
@@ -40,22 +41,43 @@ impl IndexEntry {
     /// Creates an entry from the sparse index URL path.
     #[must_use]
     pub fn try_from_index_url(url: &str) -> Option<Self> {
+        trace!("index_entry: parsing index URL: '{url}'");
+
         if url.contains('.') {
+            debug!("index_entry: rejecting URL with dot: '{url}'");
             return None;
         }
 
         let mut i = url.split('/');
 
-        match i.next() {
+        let result = match i.next() {
             Some("1" | "2") => match (i.next(), i.next()) {
-                (Some(name), None) => Some(IndexEntry::new(name)),
-                _ => None,
+                (Some(name), None) => {
+                    debug!("index_entry: parsed short name (1-2 chars): '{name}' from '{url}'");
+                    Some(IndexEntry::new(name))
+                }
+                other => {
+                    debug!("index_entry: failed to parse short URL '{url}': unexpected segments: {:?}", other);
+                    None
+                }
             },
             _ => match (i.next(), i.next(), i.next()) {
-                (Some(_), Some(name), None) => Some(IndexEntry::new(name)),
-                _ => None,
+                (Some(_), Some(name), None) => {
+                    debug!("index_entry: parsed long name: '{name}' from '{url}'");
+                    Some(IndexEntry::new(name))
+                }
+                other => {
+                    debug!("index_entry: failed to parse long URL '{url}': unexpected segments: {:?}", other);
+                    None
+                }
             },
+        };
+
+        if result.is_none() {
+            debug!("index_entry: could not parse index URL: '{url}'");
         }
+
+        result
     }
 
     /// Gets the crate name.

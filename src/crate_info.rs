@@ -3,6 +3,8 @@
 use std::fmt::{Display, Formatter, Result};
 use std::path::PathBuf;
 
+use log::{debug, trace};
+
 /// Crate download API endpoint suffix
 const DOWNLOAD_API_ENDPOINT: &str = "/download";
 
@@ -38,13 +40,23 @@ impl CrateInfo {
     /// Extracts crate information from the download API URL path.
     #[must_use]
     pub fn try_from_download_url(url: &str) -> Option<Self> {
+        trace!("crate_info: parsing download URL: '{url}'");
+
         let name_version = url.strip_suffix(DOWNLOAD_API_ENDPOINT)?;
+        trace!("crate_info: stripped suffix, remaining: '{name_version}'");
 
         let mut i = name_version.split('/');
-        match (i.next(), i.next(), i.next()) {
-            (Some(name), Some(version), None) => Some(CrateInfo::new(name, version)),
-            _ => None,
-        }
+        let result = match (i.next(), i.next(), i.next()) {
+            (Some(name), Some(version), None) => {
+                debug!("crate_info: parsed crate info: name='{name}', version='{version}'");
+                Some(CrateInfo::new(name, version))
+            }
+            other => {
+                debug!("crate_info: failed to parse download URL '{url}': unexpected segments: {:?}", other);
+                None
+            }
+        };
+        result
     }
 
     /// Builds the crate download URL (relative).
