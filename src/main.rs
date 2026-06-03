@@ -29,18 +29,11 @@ mod index_entry;
 mod metadata_cache;
 
 use std::env;
-use std::fmt::Display;
+use std::fmt::{Display, Formatter};
 use std::io::Read;
 use std::path::{Path, PathBuf};
-#[cfg(feature = "native-certs")]
-use std::sync::atomic::AtomicBool;
 use std::sync::OnceLock;
 use std::time::Duration;
-
-#[cfg(feature = "native-certs")]
-use std::sync::atomic::Ordering;
-#[cfg(feature = "native-certs")]
-use std::sync::Arc;
 
 use pico_args::Arguments;
 
@@ -84,9 +77,6 @@ const DEFAULT_CACHE_DIR: &str = "/var/cache/crates-io-proxy";
 
 /// Default index cache entry Time-to-Live in seconds
 const DEFAULT_CACHE_TTL_SECS: u64 = 3600;
-
-/// Default index entry download buffer capacity
-const INDEX_ENTRY_CAPACITY: usize = 0x10000;
 
 /// Limit the download item size to 16 MiB
 const MAX_CRATE_SIZE: usize = 0x100_0000;
@@ -140,80 +130,54 @@ struct IndexResponse {
     data: Vec<u8>,
 }
 
-/// Global flag to enable system native root certificates at runtime.
-#[cfg(feature = "native-certs")]
-static USE_NATIVE_CERTS: AtomicBool = AtomicBool::new(false);
-
-/// Loads system native root certificates into a rustls client config.
-#[cfg(feature = "native-certs")]
-fn load_native_certs_config() -> Arc<rustls::ClientConfig> {
-    let mut roots = rustls::RootCertStore::empty();
-    let certs = rustls_native_certs::load_native_certs()
-        .expect("failed to load system native root certificates");
-    let count = certs.len();
-    for cert in certs {
-        roots.add(cert).ok();
-    }
-    info!("native-certs: loaded {} system root certificates", count);
-    let config = rustls::ClientConfig::builder()
-        .with_root_certificates(roots)
-        .with_no_client_auth();
-    Arc::new(config)
+/// Upstream fetch error type.
+#[derive(Debug)]
+enum FetchError {
+    /// HTTP error status from upstream.
+    Http(u16, String),
+    /// Network/transport error.
+    Transport(String),
 }
 
-/// Gets the server-global ureq client instance.
-///
-/// The global agent instance is required to use HTTP request pipelining.
-fn ureq_agent() -> ureq::Agent {
-    static AGENT: OnceLock<ureq::Agent> = OnceLock::new();
+impl Display for FetchError {
+    fn fmt(&self, f: &mut Formatter<'_>) -> std::fmt::Result {
+        match self {
+            FetchError::Http(code, msg) => write!(f, "HTTP {code}: {msg}"),
+            FetchError::Transport(msg) => write!(f, "connection failed: {msg}"),
+        }
+    }
+}
 
-    AGENT
+impl std::error::Error for FetchError {}
+
+/// Gets the server-global reqwest blocking client instance.
+fn reqwest_client() -> reqwest::blocking::Client {
+    static CLIENT: OnceLock<reqwest::blocking::Client> = OnceLock::new();
+
+    CLIENT
         .get_or_init(|| {
-            let mut builder = ureq::builder().user_agent(HTTP_USER_AGENT);
+            let builder = reqwest::blocking::Client::builder()
+                .user_agent(HTTP_USER_AGENT)
+                .timeout(Duration::from_secs(60));
 
             #[cfg(feature = "native-certs")]
-            if USE_NATIVE_CERTS.load(Ordering::Relaxed) {
-                info!("fetch: using system native root certificates");
-                builder = builder.tls_config(load_native_certs_config());
+            {
+                info!("fetch: using system native root certificates (via reqwest rustls-tls-native-roots)");
             }
 
-            let proxy_url = env::var("https_proxy")
-                .or_else(|_| env::var("HTTPS_PROXY"))
-                .ok();
-
-            if let Some(ref url) = proxy_url {
-                info!("fetch: detected https_proxy environment variable: {url}");
-                match ureq::Proxy::new(url) {
-                    Ok(proxy) => {
-                        info!("fetch: using upstream HTTPS proxy: {url}");
-                        builder = builder.proxy(proxy);
-                    }
-                    Err(e) => {
-                        warn!("fetch: failed to parse https_proxy '{url}': {e}");
-                    }
-                }
-            } else {
-                debug!("fetch: no https_proxy environment variable set");
+            #[cfg(not(feature = "native-certs"))]
+            {
+                debug!("fetch: using embedded webpki root certificates");
             }
 
-            builder.build()
+            builder.build().expect("failed to build HTTP client")
         })
         .clone()
 }
 
-/// Makes boxed custom ureq status errors for `download_crate()`.
-fn ureq_status_error(status_code: u16, msg: &str) -> Box<ureq::Error> {
-    assert!(status_code >= 400);
-
-    Box::new(ureq::Error::Status(
-        status_code,
-        ureq::Response::new(status_code, msg, msg).unwrap(),
-    ))
-}
-
 /// Downloads the crate file from the upstream download server
 /// (usually <https://crates.io/>).
-fn download_crate(site_url: &Url, crate_info: &CrateInfo) -> Result<Vec<u8>, Box<ureq::Error>> {
+fn download_crate(site_url: &Url, crate_info: &CrateInfo) -> Result<Vec<u8>, FetchError> {
     let url = site_url
         .join(CRATES_API_PATH)
         .unwrap()
@@ -222,63 +186,38 @@ fn download_crate(site_url: &Url, crate_info: &CrateInfo) -> Result<Vec<u8>, Box
 
     debug!("fetch: downloading crate from upstream: {url}");
 
-    let response = ureq_agent()
-        .request_url("GET", &url)
-        .call()
-        .map_err(Box::new)?;
+    let response = reqwest_client()
+        .get(url.as_str())
+        .send()
+        .map_err(|e| FetchError::Transport(e.to_string()))?;
 
     let status = response.status();
     debug!("fetch: upstream response status for crate {crate_info}: {status}");
 
     trace!("fetch: upstream response headers for crate {crate_info}:");
-    for h in response.headers_names().iter().filter_map(|name| response.header(name).map(|v| (name, v))) {
-        trace!("fetch:   {}: {}", h.0, h.1);
+    for (name, value) in response.headers() {
+        trace!("fetch:   {}: {:?}", name, value);
     }
 
-    if let Some(content_len) = response.header("Content-Length") {
-        debug!("fetch: upstream Content-Length for crate {crate_info}: {content_len}");
-        let Ok(len) = content_len.parse::<usize>() else {
-            error!("fetch: invalid Content-Length header from upstream for crate {crate_info}: '{content_len}'");
-            return Err(ureq_status_error(400, "Invalid header"));
-        };
-
-        if len > MAX_CRATE_SIZE {
-            error!("fetch: crate {crate_info} size {len} exceeds maximum {MAX_CRATE_SIZE}");
-            return Err(ureq_status_error(507, "Insufficient storage"));
-        }
-
-        let mut data: Vec<u8> = Vec::with_capacity(len);
-        response
-            .into_reader()
-            .read_to_end(&mut data)
-            .map_err(|e| Box::new(e.into()))?;
-
-        debug!("fetch: downloaded crate {crate_info}, size: {} bytes", data.len());
-        Ok(data)
-    } else {
-        // Got no "Content-Length" header, most likely because "Transfer-Encoding: chunked"
-        // is being sent by the server (crates.io servers do not do this).
-        //
-        // Using an arbitrary initial estimate for the total response size...
-        debug!("fetch: no Content-Length header for crate {crate_info}, using chunked reader");
-        let mut data: Vec<u8> = Vec::with_capacity(MAX_CRATE_SIZE / 256);
-
-        response
-            .into_reader()
-            .take(MAX_CRATE_SIZE as u64)
-            .read_to_end(&mut data)
-            .map_err(|e| Box::new(e.into()))?;
-
-        // Abort download here if the crate file has been truncated by
-        // the `reader.take()` limit above.
-        if data.len() >= MAX_CRATE_SIZE {
-            error!("fetch: crate {crate_info} exceeds maximum size {MAX_CRATE_SIZE}");
-            return Err(ureq_status_error(507, "Insufficient storage"));
-        }
-
-        debug!("fetch: downloaded crate {crate_info} (chunked), size: {} bytes", data.len());
-        Ok(data)
+    if !status.is_success() {
+        let body = response.text().unwrap_or_else(|_| "Unknown error".to_string());
+        warn!("fetch: upstream returned HTTP {status}: {body}");
+        return Err(FetchError::Http(status.as_u16(), body));
     }
+
+    let data = response
+        .bytes()
+        .map_err(|e| FetchError::Transport(e.to_string()))?
+        .to_vec();
+
+    debug!("fetch: downloaded crate {crate_info}, size: {} bytes", data.len());
+
+    if data.len() > MAX_CRATE_SIZE {
+        error!("fetch: crate {crate_info} size {} exceeds maximum {MAX_CRATE_SIZE}", data.len());
+        return Err(FetchError::Http(507, "Insufficient storage".to_string()));
+    }
+
+    Ok(data)
 }
 
 /// Downloads the sparse index entry from the upstream registry.
@@ -286,40 +225,40 @@ fn download_crate(site_url: &Url, crate_info: &CrateInfo) -> Result<Vec<u8>, Box
 fn download_index_entry(
     index_url: &Url,
     mut entry: IndexEntry,
-) -> Result<IndexResponse, Box<ureq::Error>> {
+) -> Result<IndexResponse, FetchError> {
     let url = index_url.join(&entry.to_index_url()).unwrap();
 
     debug!("fetch: downloading index entry from upstream: {url}");
 
-    let mut request = ureq_agent().request_url("GET", &url);
+    let mut request = reqwest_client().get(url.as_str());
 
     // Add cache control headers to all index requests.
     if let Some(etag) = entry.etag() {
         debug!("fetch: sending If-None-Match: {etag} for index entry {entry}");
-        request = request.set("If-None-Match", etag);
+        request = request.header("If-None-Match", etag);
     } else if let Some(last_modified) = entry.last_modified() {
         debug!("fetch: sending If-Modified-Since: {last_modified} for index entry {entry}");
-        request = request.set("If-Modified-Since", &last_modified);
+        request = request.header("If-Modified-Since", &last_modified);
     } else {
         debug!("fetch: no cache headers for index entry {entry}");
     }
 
-    let response = request.call().map_err(Box::new)?;
+    let response = request.send().map_err(|e| FetchError::Transport(e.to_string()))?;
 
     let status = response.status();
     debug!("fetch: upstream response status for index entry {entry}: {status}");
 
     trace!("fetch: upstream response headers for index entry {entry}:");
-    for h in response.headers_names().iter().filter_map(|name| response.header(name).map(|v| (name, v))) {
-        trace!("fetch:   {}: {}", h.0, h.1);
+    for (name, value) in response.headers() {
+        trace!("fetch:   {}: {:?}", name, value);
     }
 
     // Update the index entry metadata from the upstream response.
-    if let Some(etag) = response.header("ETag") {
+    if let Some(etag) = response.headers().get("etag").and_then(|v| v.to_str().ok()) {
         debug!("fetch: upstream ETag for index entry {entry}: {etag}");
         entry.set_etag(etag);
     }
-    if let Some(last_modified) = response.header("Last-Modified") {
+    if let Some(last_modified) = response.headers().get("last-modified").and_then(|v| v.to_str().ok()) {
         debug!("fetch: upstream Last-Modified for index entry {entry}: {last_modified}");
         entry.set_last_modified(last_modified);
     }
@@ -327,17 +266,25 @@ fn download_index_entry(
     // Update the upstream server access timestamp.
     entry.set_last_updated();
 
-    let mut data: Vec<u8> = Vec::with_capacity(INDEX_ENTRY_CAPACITY);
-    response
-        .into_reader()
-        .read_to_end(&mut data)
-        .map_err(|e| Box::new(e.into()))?;
+    let data = if status.as_u16() == 304 {
+        // No body for 304 Not Modified
+        Vec::new()
+    } else if !status.is_success() {
+        let body = response.text().unwrap_or_else(|_| "Unknown error".to_string());
+        warn!("fetch: upstream returned HTTP {status}: {body}");
+        return Err(FetchError::Http(status.as_u16(), body));
+    } else {
+        response
+            .bytes()
+            .map_err(|e| FetchError::Transport(e.to_string()))?
+            .to_vec()
+    };
 
     debug!("fetch: downloaded index entry {entry}, size: {} bytes", data.len());
 
     Ok(IndexResponse {
         entry,
-        status,
+        status: status.as_u16(),
         data,
     })
 }
@@ -439,23 +386,22 @@ fn format_json_error(error: impl Display) -> String {
     format!(r#"{{"errors":[{{"detail":"{error}"}}]}}"#)
 }
 
-/// Sends the HTTP error response from an ureq client error.
-fn send_fetch_error_response(request: Request, error: Box<ureq::Error>) {
+/// Sends the HTTP error response from a fetch error.
+fn send_fetch_error_response(request: Request, error: FetchError) {
     error!("proxy: forwarding upstream error to client: {error}");
-    match *error {
+    match error {
         // Forward the HTTP error status received from the upstream server.
-        ureq::Error::Status(code, response) => {
-            let json = response.into_string().unwrap_or_else(format_json_error);
-            warn!("fetch: upstream returned HTTP status {code}: {json}");
-            send_json_response(request, code, json);
+        FetchError::Http(code, body) => {
+            warn!("fetch: upstream returned HTTP status {code}: {body}");
+            send_json_response(request, code, body);
         }
 
         // Return HTTP 502 Bad Gateway for client connection errors.
-        ureq::Error::Transport(err) => {
-            error!("fetch: connection failed: {err}");
-            send_json_response(request, 502, format_json_error(err));
+        FetchError::Transport(msg) => {
+            error!("fetch: connection failed: {msg}");
+            send_json_response(request, 502, format_json_error(msg));
         }
-    };
+    }
 }
 
 /// Forwards the crate download request to the upstream server.
@@ -540,9 +486,9 @@ fn forward_index_request(
         }
         Err(err) => {
             error!("fetch: failed to download index entry {entry}: {err}");
-            if let ureq::Error::Transport(err) = err.as_ref() {
+            if let FetchError::Transport(ref msg) = err {
                 if let Some(data) = cache_fetch_index_entry(&config.index_dir, &entry) {
-                    error!("fetch: index connection failed: {err}");
+                    error!("fetch: index connection failed: {msg}");
 
                     // The upstream registry can not be reached at the moment, likely
                     // due to an intermittent network failure.
@@ -825,7 +771,7 @@ fn main() {
 
     if args.contains(["-N", "--native-certs"]) {
         #[cfg(feature = "native-certs")]
-        USE_NATIVE_CERTS.store(true, Ordering::Relaxed);
+        info!("native-certs: enabled via feature flag (reqwest uses rustls-tls-native-roots)");
 
         #[cfg(not(feature = "native-certs"))]
         warn!("native-certs support not compiled in; recompile with --features native-certs");
