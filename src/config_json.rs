@@ -34,3 +34,40 @@ pub(super) fn gen_config_json_file(config: &ProxyConfig) -> String {
     debug!("config_json: generated config.json: dl='{dl}', api='{api}'");
     json
 }
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use std::path::PathBuf;
+    use std::time::Duration;
+    use url::Url;
+
+    fn test_config() -> ProxyConfig {
+        ProxyConfig {
+            index_url: Url::parse("https://index.crates.io/").unwrap(),
+            upstream_url: Url::parse("https://crates.io/").unwrap(),
+            proxy_url: Url::parse("http://localhost:3080/").unwrap(),
+            index_dir: PathBuf::from("/tmp/index"),
+            crates_dir: PathBuf::from("/tmp/crates"),
+            cache_ttl: Duration::from_secs(3600),
+        }
+    }
+
+    #[test]
+    fn test_is_config_json_url() {
+        assert!(is_config_json_url("config.json"));
+        assert!(!is_config_json_url("config.json.bak"));
+        assert!(!is_config_json_url("index/config.json"));
+        assert!(!is_config_json_url(""));
+    }
+
+    #[test]
+    fn test_gen_config_json_file() {
+        let config = test_config();
+        let json = gen_config_json_file(&config);
+        assert_eq!(
+            json,
+            r#"{"dl":"http://localhost:3080/api/v1/crates","api":"https://crates.io"}"#
+        );
+    }
+}

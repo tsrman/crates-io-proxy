@@ -683,6 +683,16 @@ fn handle_index_request(request: Request, index_url: &str, config: &ProxyConfig)
     forward_index_request(request, index_entry, mtimed_entry, config.clone());
 }
 
+/// Extracts the path from an absolute URI (e.g. `http://host:3080/index/config.json`).
+///
+/// Corporate HTTP proxies may send requests using absolute URIs.
+#[must_use]
+pub fn extract_path_from_absolute_uri(url: &str) -> Option<&str> {
+    let after_scheme = url.split_once("://")?.1;
+    let path_idx = after_scheme.find('/')?;
+    Some(&after_scheme[path_idx..])
+}
+
 /// Processes one HTTP GET request.
 ///
 /// Only registry index and download API requests are supported.
@@ -699,14 +709,12 @@ fn handle_get_request(request: Request, config: &ProxyConfig) {
     // Handle absolute URI requests that may come via corporate HTTP proxies.
     // e.g. "GET http://host:3080/index/config.json HTTP/1.1"
     if url.contains("://") {
-        if let Some(path_start) = url.find('/') {
-            // Skip "http://" or "https://" to find the host, then skip host to find the path
-            let after_scheme = &url[path_start + 2..]; // after "//"
-            if let Some(path_idx) = after_scheme.find('/') {
-                let extracted_path = &after_scheme[path_idx..];
-                debug!("proxy: detected absolute URI, extracting path: '{extracted_path}' from '{url}'");
-                url = extracted_path.to_string();
-            } else {
+        match extract_path_from_absolute_uri(&url) {
+            Some(path) => {
+                debug!("proxy: detected absolute URI, extracting path: '{path}' from '{url}'");
+                url = path.to_string();
+            }
+            None => {
                 warn!("proxy: absolute URI without path: '{url}'");
                 send_error_response(request, 404);
                 return;
@@ -972,4 +980,49 @@ fn main() {
 
     // Start the main HTTP server.
     main_loop(&listen_addr, &config)
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn test_extract_path_from_absolute_uri() {
+        assert_eq!(
+            extract_path_from_absolute_uri("http://host:3080/index/config.json"),
+            Some("/index/config.json")
+        );
+        assert_eq!(
+            extract_path_from_absolute_uri("https://host:3080/api/v1/crates/foo/1.0.0/download"),
+            Some("/api/v1/crates/foo/1.0.0/download")
+        );
+        assert_eq!(
+            extract_path_from_absolute_uri("http://localhost/index/1/a"),
+            Some("/index/1/a")
+        );
+    }
+
+    #[test]
+    fn test_extract_path_from_absolute_uri_no_path() {
+        assert_eq!(extract_path_from_absolute_uri("http://host:3080"), None);
+        assert_eq!(extract_path_from_absolute_uri("https://host"), None);
+    }
+
+    #[test]
+    fn test_extract_path_from_relative_uri() {
+        assert_eq!(extract_path_from_absolute_uri("/index/config.json"), None);
+        assert_eq!(
+            extract_path_from_absolute_uri("api/v1/crates/foo/1.0.0/download"),
+            None
+        );
+    }
+
+    #[test]
+    fn test_fetch_error_display() {
+        let err = FetchError::Http(404, "Not Found".to_string());
+        assert_eq!(format!("{err}"), "HTTP 404: Not Found");
+
+        let err = FetchError::Transport("connection refused".to_string());
+        assert_eq!(format!("{err}"), "connection failed: connection refused");
+    }
 }

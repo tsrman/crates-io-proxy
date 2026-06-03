@@ -35,3 +35,29 @@ pub fn metadata_invalidate_index_entry(entry: &IndexEntry) {
     debug!("metadata_cache: invalidating metadata for '{}'", name);
     INDEX_CACHE.write().unwrap().remove(name);
 }
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn test_metadata_store_and_fetch() {
+        let entry = IndexEntry::new("test-crate");
+        metadata_store_index_entry(&entry);
+        assert!(metadata_fetch_index_entry("test-crate").is_some());
+    }
+
+    #[test]
+    fn test_metadata_fetch_miss() {
+        assert!(metadata_fetch_index_entry("nonexistent").is_none());
+    }
+
+    #[test]
+    fn test_metadata_invalidate() {
+        let entry = IndexEntry::new("temp-crate");
+        metadata_store_index_entry(&entry);
+        assert!(metadata_fetch_index_entry("temp-crate").is_some());
+        metadata_invalidate_index_entry(&entry);
+        assert!(metadata_fetch_index_entry("temp-crate").is_none());
+    }
+}

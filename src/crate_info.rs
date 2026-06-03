@@ -84,3 +84,49 @@ impl CrateInfo {
         PathBuf::from(self.name()).join(self.to_file_name())
     }
 }
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn test_try_from_download_url() {
+        assert_eq!(
+            CrateInfo::try_from_download_url("foo/1.0.0/download"),
+            Some(CrateInfo::new("foo", "1.0.0"))
+        );
+        assert_eq!(
+            CrateInfo::try_from_download_url("my-crate/2.1.0-rc1/download"),
+            Some(CrateInfo::new("my-crate", "2.1.0-rc1"))
+        );
+    }
+
+    #[test]
+    fn test_try_from_download_url_invalid() {
+        assert_eq!(CrateInfo::try_from_download_url(""), None);
+        assert_eq!(CrateInfo::try_from_download_url("foo/1.0.0"), None);
+        assert_eq!(
+            CrateInfo::try_from_download_url("foo/1.0.0/extra/download"),
+            None
+        );
+        assert_eq!(CrateInfo::try_from_download_url("foo/download"), None);
+    }
+
+    #[test]
+    fn test_to_download_url() {
+        let info = CrateInfo::new("foo", "1.0.0");
+        assert_eq!(info.to_download_url(), "foo/1.0.0/download");
+    }
+
+    #[test]
+    fn test_to_file_name() {
+        let info = CrateInfo::new("foo", "1.0.0");
+        assert_eq!(info.to_file_name(), "foo-1.0.0.crate");
+    }
+
+    #[test]
+    fn test_to_file_path() {
+        let info = CrateInfo::new("foo", "1.0.0");
+        assert_eq!(info.to_file_path(), PathBuf::from("foo/foo-1.0.0.crate"));
+    }
+}
