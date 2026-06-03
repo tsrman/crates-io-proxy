@@ -118,6 +118,7 @@ Options:
     -S, --proxy-url URL        this proxy server URL (http://localhost:3080/)
     -C, --cache-dir DIR        proxy cache directory (/var/cache/crates-io-proxy)
     -T, --cache-ttl SECONDS    index cache entry Time-to-Live in seconds (3600)
+    -A, --ca-cert PATH         additional CA certificate PEM file for TLS
 
 Environment:
     INDEX_CRATES_IO_URL        same as --index-url option
@@ -125,6 +126,7 @@ Environment:
     CRATES_IO_PROXY_URL        same as --proxy-url option
     CRATES_IO_PROXY_CACHE_DIR  same as --cache-dir option
     CRATES_IO_PROXY_CACHE_TTL  same as --cache-ttl option
+    CRATES_IO_PROXY_CA_CERT    same as --ca-cert option
     https_proxy                upstream HTTPS proxy for outbound requests
     HTTPS_PROXY                same as https_proxy (fallback)
 ```
@@ -140,7 +142,24 @@ export https_proxy=http://proxy.example.com:3128
 crates-io-proxy
 ```
 
-Both `http://` and `socks5://` upstream proxy URLs are supported.
+Supported upstream proxy schemes: `http://`, `https://`, and `socks5://`.
+
+#### HTTPS proxy with corporate CA
+
+If your upstream proxy uses HTTPS (`https://proxy.example.com:3128`) and
+presents a certificate signed by a corporate CA, you can provide the CA
+certificate via the `--ca-cert` flag or the `CRATES_IO_PROXY_CA_CERT`
+environment variable:
+
+```bash
+export https_proxy=https://proxy.example.com:3128
+export CRATES_IO_PROXY_CA_CERT=/etc/ssl/certs/company-ca.pem
+crates-io-proxy
+```
+
+This is useful when the corporate CA is not installed in the system
+certificate store or when running in containers without modifying the
+system-wide trust anchors.
 
 Advanced configuration
 ----------------------
