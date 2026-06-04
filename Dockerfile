@@ -3,7 +3,7 @@
 #
 
 ### First stage: Build the application itself.
-FROM rust:alpine as builder
+FROM rust:alpine AS builder
 
 WORKDIR /builds/crates-io-proxy
 
@@ -12,15 +12,15 @@ COPY . .
 
 # Install the build deps and build the application with cargo.
 RUN \
-apk add musl-dev && \
-cargo build --release
+apk add --no-cache musl-dev && \
+cargo build --release --features native-certs
 
 ### Second stage: Copy the built application into the runtime image.
-FROM alpine:latest as runner
+FROM alpine:latest AS runner
 
-LABEL version="0.2.1"
-LABEL description="crates.io proxy container image"
-LABEL maintainer="Sergey Kvachonok <ravenexp@gmail.com>"
+LABEL org.opencontainers.image.title="crates-io-proxy"
+LABEL org.opencontainers.image.description="Caching HTTP proxy server for the crates.io registry"
+LABEL org.opencontainers.image.source="https://github.com/tsrman/crates-io-proxy"
 
 # Install the compiled executable into the system.
 COPY --from=builder /builds/crates-io-proxy/target/release/crates-io-proxy /usr/bin/crates-io-proxy
@@ -35,5 +35,8 @@ chown cratesioxy /var/cache/crates-io-proxy
 USER cratesioxy
 WORKDIR /var/empty
 
+# Expose the default proxy port.
+EXPOSE 3080
+
 # Run the proxy server with the default configuration.
-CMD crates-io-proxy --verbose
+CMD ["crates-io-proxy", "--verbose"]
